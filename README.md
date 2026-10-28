@@ -67,16 +67,6 @@ python spotify_extractor.py
 
 Run the tests with `pip install pytest` and then `pytest -v` (the GUI test is skipped automatically on machines without a display).
 
-## Releases (automatic)
-
-The executable is built by GitHub Actions, you do not need to build it by hand. To publish a new version:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-The workflow in `.github/workflows/release.yml` runs the tests, builds `SpotiSieve.exe` on Windows and attaches it to a new GitHub Release.
 
 To build it locally instead:
 
