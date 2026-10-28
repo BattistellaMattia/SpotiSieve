@@ -1,0 +1,8 @@
+# Official library for communicating with the Spotify Web API
+spotipy>=2.24.0
+
+# Modern dark/Spotify-style graphical interface
+customtkinter>=5.2.2
+
+# Secure management of personal API keys using a local .env file
+python-dotenv>=1.0.1

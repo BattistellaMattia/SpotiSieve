@@ -1,0 +1,140 @@
+name: CI/CD — Test, Build & Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # =========================================================================
+  # STAGE 1: AUTOMATED TESTING & CODE VERIFICATION (GATEKEEPER)
+  # =========================================================================
+  test:
+    name: 1. Lint & Smoke Test Application
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies & Test Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest ruff
+
+      - name: Static Syntax & Runtime Error Check (Ruff)
+        run: |
+          # Fails on syntax errors, undefined variables, or broken imports
+          ruff check spotify_extractor.py --select=E9,F63,F7,F82 --output-format=full
+          python -m py_compile spotify_extractor.py
+
+      - name: Run Unit & GUI Boot Smoke Tests (Pytest)
+        run: |
+          pytest test_app.py -v
+
+  # =========================================================================
+  # STAGE 2: COMPILE EXECUTABLE & VERIFY BINARY EXECUTION
+  # =========================================================================
+  build:
+    name: 2. Build & Smoke-Test Windows .exe
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies & PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Compile SpotiSieve.exe
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --collect-all customtkinter --name "SpotiSieve" spotify_extractor.py
+
+      - name: Binary Execution Smoke Test (Verify .exe Launches Without Crashing)
+        shell: pwsh
+        run: |
+          if (-Not (Test-Path "dist\SpotiSieve.exe")) {
+            Write-Error "Build failed: dist\SpotiSieve.exe was not generated."
+            exit 1
+          }
+
+          Write-Host "Starting SpotiSieve.exe for runtime verification..."
+          $process = Start-Process -FilePath "dist\SpotiSieve.exe" -PassThru
+          Start-Sleep -Seconds 5
+
+          if ($process.HasExited) {
+            Write-Error "Smoke test FAILED: SpotiSieve.exe crashed on startup with exit code $($process.ExitCode)."
+            exit 1
+          }
+
+          Stop-Process -Id $process.Id -Force
+          Write-Host "Smoke test PASSED: SpotiSieve.exe booted cleanly and remained stable."
+
+      - name: Generate SHA-256 Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Path "dist\SpotiSieve.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  SpotiSieve.exe" | Out-File -FilePath "dist\SpotiSieve.exe.sha256" -Encoding ascii
+          Get-Content "dist\SpotiSieve.exe.sha256"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpotiSieve-Windows-Build
+          path: |
+            dist/SpotiSieve.exe
+            dist/SpotiSieve.exe.sha256
+          retention-days: 14
+
+  # =========================================================================
+  # STAGE 3: AUTOMATED GITHUB RELEASE (ONLY ON VERSION TAGS AFTER TESTS PASS)
+  # =========================================================================
+  release:
+    name: 3. Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Verified Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: SpotiSieve-Windows-Build
+          path: release_assets
+
+      - name: Create GitHub Release & Attach Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_assets/SpotiSieve.exe
+            release_assets/SpotiSieve.exe.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
