@@ -1,13 +1,31 @@
-import os
+"""SpotiSieve - filter a Spotify playlist export by musical genre.
+
+No Spotify API key is needed to filter a playlist:
+  * the playlist comes from a CSV file (e.g. exported with Exportify),
+  * genres come from the CSV itself or, when missing, from MusicBrainz (free, no key).
+
+A Spotify login is needed ONLY if you want the one-click "Import to Spotify" button.
+Without it you can still copy the track links or save the result as a CSV.
+"""
+import base64
+import csv
+import hashlib
+import json
 import re
+import secrets
 import sys
 import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
 import customtkinter as ctk
-from tkinter import messagebox
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-from dotenv import load_dotenv, set_key
+from tkinter import filedialog, messagebox
 
 
 def get_app_dir() -> Path:
@@ -17,16 +35,33 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-# Always save .env and .cache right next to the executable
+# Local files are always saved right next to the executable
 APP_DIR = get_app_dir()
-ENV_FILE_PATH = APP_DIR / ".env"
-CACHE_FILE_PATH = APP_DIR / ".cache"
+SETTINGS_FILE_PATH = APP_DIR / "settings.json"
+CACHE_FILE_PATH = APP_DIR / ".cache"              # Spotify login token (optional login)
+GENRE_CACHE_FILE_PATH = APP_DIR / "genre_cache.json"
 
-load_dotenv(dotenv_path=ENV_FILE_PATH)
-
-# Default Spotify OAuth configuration
+# ------------------------------------------------------------------
+# Optional Spotify login (only used by the "Import to Spotify" button)
+# ------------------------------------------------------------------
+# A public Client ID is NOT a secret (PKCE login needs no Client Secret).
+# If you own a Spotify Developer app, paste its Client ID here (or in the
+# in-app settings) to enable one-click login. Leave empty to disable it.
+BUNDLED_CLIENT_ID = ""
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback"
-SCOPE = "playlist-read-private playlist-modify-public playlist-modify-private"
+SCOPE = "playlist-modify-private playlist-modify-public"
+SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API_URL = "https://api.spotify.com/v1"
+
+# ------------------------------------------------------------------
+# Genre lookup (MusicBrainz: free, no API key, max 1 request/second)
+# ------------------------------------------------------------------
+MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2/artist/"
+USER_AGENT = "SpotiSieve/2.0 ( https://github.com/BattistellaMattia/SpotiSieve )"
+MB_MIN_INTERVAL = 1.1  # seconds between requests, as requested by MusicBrainz
+
+EXPORTIFY_URL = "https://watsonbox.github.io/exportify/"
 
 # 24 musical genres arranged in 3 rows of 8 columns
 GENRES_LIST = [
@@ -34,6 +69,15 @@ GENRES_LIST = [
     "edm", "house", "techno", "dance", "metal", "punk", "alternative", "soul",
     "jazz", "blues", "classical", "reggaeton", "latin", "funk", "country", "lo-fi"
 ]
+
+# Alternative spellings that should count as the same genre
+GENRE_SYNONYMS = {
+    "hip hop": ("hip hop", "hiphop"),
+    "r&b": ("r&b", "rnb", "rhythm and blues"),
+    "electronic": ("electronic", "electronica"),
+    "edm": ("edm", "electronic dance music"),
+    "lo-fi": ("lo-fi", "lofi"),
+}
 
 # Spotify color theme palette
 COLOR_SPOTIFY_GREEN = "#1DB954"
@@ -44,15 +88,401 @@ COLOR_REMOVE = "#e22134"
 COLOR_REMOVE_HOVER = "#ff4b5c"
 
 
+# ==================================================================
+# PURE HELPERS (no GUI, easy to test)
+# ==================================================================
+def normalize_text(text: str) -> str:
+    """Lowercase and turn separators into spaces ('Hip-Hop' -> 'hip hop')."""
+    text = re.sub(r"[-_/]+", " ", str(text).lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fold_name(text: str) -> str:
+    """Accent-insensitive, punctuation-insensitive key used to compare artist names."""
+    text = unicodedata.normalize("NFKD", str(text))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def genre_matches(selected: str, tag: str) -> bool:
+    """True if the selected genre appears as a whole word/phrase inside the tag.
+
+    'pop' matches 'dance pop' and 'k-pop' but 'rap' does not match 'trap'.
+    """
+    tag_norm = normalize_text(tag)
+    for term in GENRE_SYNONYMS.get(selected, (selected,)):
+        term_norm = re.escape(normalize_text(term))
+        if re.search(rf"(?<![a-z0-9&]){term_norm}(?![a-z0-9&])", tag_norm):
+            return True
+    return False
+
+
+def track_matches(selected_genres, track_genres) -> bool:
+    return any(genre_matches(sel, tag) for sel in selected_genres for tag in track_genres)
+
+
+def parse_track_uri(value: str):
+    """Return a normalized 'spotify:track:<id>' from a URI, a link or a bare ID (else None)."""
+    value = (value or "").strip()
+    match = (
+        re.search(r"spotify:track:([A-Za-z0-9]{22})", value)
+        or re.search(r"open\.spotify\.com/(?:intl-[a-z]+/)?track/([A-Za-z0-9]{22})", value)
+        or re.fullmatch(r"([A-Za-z0-9]{22})", value)
+    )
+    return f"spotify:track:{match.group(1)}" if match else None
+
+
+def uri_to_link(uri: str) -> str:
+    return "https://open.spotify.com/track/" + uri.split(":")[-1]
+
+
+# Accepted CSV column names (lowercase). Covers Exportify and similar exporters.
+CSV_COLUMNS = {
+    "uri": ("track uri", "spotify uri", "uri", "spotify id", "track id", "track link", "link", "url"),
+    "title": ("track name", "track title", "title", "name", "track", "song"),
+    "album": ("album name", "album"),
+    "artists": ("artist name(s)", "artist names", "artist name", "artists", "artist"),
+    "genres": ("genres", "genre", "artist genres", "artist genre"),
+}
+
+
+def parse_playlist_csv(path):
+    """Read a playlist CSV and return a list of track dictionaries."""
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"File not found:\n{path}")
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(handle, dialect=dialect)
+        if not reader.fieldnames:
+            raise ValueError("The CSV file is empty.")
+
+        headers = {h.strip().lower(): h for h in reader.fieldnames if h}
+
+        def find(kind):
+            for candidate in CSV_COLUMNS[kind]:
+                if candidate in headers:
+                    return headers[candidate]
+            return None
+
+        col_uri, col_title = find("uri"), find("title")
+        col_album, col_artists, col_genres = find("album"), find("artists"), find("genres")
+        if not col_title or not col_artists:
+            raise ValueError(
+                "Could not find the track title and artist columns.\n"
+                "Export the playlist with Exportify (it includes 'Track Name' and 'Artist Name(s)')."
+            )
+
+        tracks, seen = [], set()
+        for index, row in enumerate(reader):
+            title = (row.get(col_title) or "").strip()
+            artists = [a.strip() for a in (row.get(col_artists) or "").split(";") if a.strip()]
+            if not title or not artists:
+                continue
+
+            spotify_uri = parse_track_uri(row.get(col_uri) or "") if col_uri else None
+            key = spotify_uri or f"row:{index}"
+            dedupe_key = spotify_uri or (title.lower(), artists[0].lower())
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            raw_genres = (row.get(col_genres) or "") if col_genres else ""
+            csv_genres = [g.strip().lower() for g in re.split(r"[,;]", raw_genres) if g.strip()]
+
+            tracks.append({
+                "uri": key,
+                "spotify_uri": spotify_uri,
+                "title": title,
+                "album": (row.get(col_album) or "").strip() if col_album else "",
+                "artists": artists,
+                "csv_genres": csv_genres,
+            })
+    return tracks
+
+
+# ------------------------------------------------------------------
+# MusicBrainz genre lookup
+# ------------------------------------------------------------------
+class GenreServiceError(Exception):
+    """Raised when the genre service cannot be reached."""
+
+
+def extract_tags(artist: dict, limit: int = 15):
+    """Collect genre/tag names from a MusicBrainz artist object, best voted first."""
+    items = list(artist.get("genres", [])) + list(artist.get("tags", []))
+    items = [i for i in items if i.get("name") and i.get("count", 1) > 0]
+    items.sort(key=lambda i: i.get("count", 0), reverse=True)
+    names = []
+    for item in items:
+        name = item["name"].lower()
+        if name not in names:
+            names.append(name)
+    return names[:limit]
+
+
+def pick_best_artist(name: str, candidates):
+    """Return the first candidate whose name matches exactly (ignoring accents/punctuation)."""
+    wanted = fold_name(name)
+    for candidate in candidates:
+        if fold_name(candidate.get("name", "")) == wanted:
+            return candidate
+    return None
+
+
+def fetch_musicbrainz_genres(name: str):
+    """Query MusicBrainz for one artist and return its genre tags."""
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    params = urllib.parse.urlencode({"query": f'artist:"{escaped}"', "fmt": "json", "limit": 5})
+    request = urllib.request.Request(
+        f"{MUSICBRAINZ_URL}?{params}",
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+    )
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = json.load(response)
+            break
+        except urllib.error.HTTPError as err:
+            if err.code in (429, 503) and attempt == 0:
+                time.sleep(3)  # polite retry when rate-limited
+                continue
+            raise GenreServiceError(f"MusicBrainz returned HTTP {err.code}.") from err
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            raise GenreServiceError(f"Cannot reach MusicBrainz: {err}") from err
+
+    best = pick_best_artist(name, data.get("artists", []))
+    return extract_tags(best) if best else []
+
+
+class GenreLookup:
+    """Artist -> genres lookup with a persistent local cache and request throttling."""
+
+    def __init__(self, cache_path, fetcher=fetch_musicbrainz_genres,
+                 min_interval=MB_MIN_INTERVAL, sleep=time.sleep, clock=time.monotonic):
+        self.cache_path = Path(cache_path)
+        self.fetcher = fetcher
+        self.min_interval = min_interval
+        self._sleep = sleep
+        self._clock = clock
+        self._last_request = None
+        self._unsaved = 0
+        self.cache = self._load()
+
+    def _load(self):
+        try:
+            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _key(name):
+        return name.strip().lower()
+
+    def has(self, name) -> bool:
+        return self._key(name) in self.cache
+
+    def get(self, name):
+        key = self._key(name)
+        if key in self.cache:
+            return self.cache[key]
+
+        if self._last_request is not None:
+            wait = self.min_interval - (self._clock() - self._last_request)
+            if wait > 0:
+                self._sleep(wait)
+        try:
+            genres = self.fetcher(name)
+        finally:
+            self._last_request = self._clock()
+
+        self.cache[key] = genres
+        self._unsaved += 1
+        if self._unsaved >= 25:
+            self.save()
+        return genres
+
+    def save(self):
+        try:
+            self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False), encoding="utf-8")
+            self._unsaved = 0
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------
+# Optional Spotify login (PKCE: no Client Secret required)
+# ------------------------------------------------------------------
+class SpotifyAPIError(Exception):
+    def __init__(self, status, body):
+        super().__init__(f"Spotify API error {status}: {body}")
+        self.status = status
+
+
+def _post_form(url, data):
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(data).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as err:
+        raise SpotifyAPIError(err.code, err.read().decode(errors="replace")) from err
+
+
+def _save_token(cache_path, token):
+    token["expires_at"] = time.time() + int(token.get("expires_in", 3600))
+    Path(cache_path).write_text(json.dumps(token), encoding="utf-8")
+
+
+def spotify_login(client_id, redirect_uri, cache_path, timeout=180, open_browser=webbrowser.open):
+    """Return a valid access token, reusing/refreshing the saved one or asking the user to log in."""
+    cache_path = Path(cache_path)
+
+    # 1. Reuse or refresh the saved token
+    try:
+        saved = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = None
+    if saved and saved.get("client_id") == client_id:
+        if saved.get("expires_at", 0) - 60 > time.time():
+            return saved["access_token"]
+        if saved.get("refresh_token"):
+            try:
+                fresh = _post_form(SPOTIFY_TOKEN_URL, {
+                    "grant_type": "refresh_token",
+                    "refresh_token": saved["refresh_token"],
+                    "client_id": client_id,
+                })
+                fresh.setdefault("refresh_token", saved["refresh_token"])
+                fresh["client_id"] = client_id
+                _save_token(cache_path, fresh)
+                return fresh["access_token"]
+            except SpotifyAPIError:
+                pass  # fall through to a new login
+
+    # 2. New login in the browser (Authorization Code with PKCE)
+    parsed = urllib.parse.urlparse(redirect_uri)
+    if parsed.hostname not in ("127.0.0.1", "localhost") or not parsed.port:
+        raise ValueError("The Redirect URI must look like http://127.0.0.1:8888/callback")
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    result = {}
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if urllib.parse.urlparse(self.path).path != (parsed.path or "/"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            result["code"] = (query.get("code") or [None])[0]
+            result["error"] = (query.get("error") or [None])[0]
+            result["state"] = (query.get("state") or [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body style='font-family:sans-serif;background:#121212;color:#fff;"
+                b"text-align:center;padding-top:80px'><h2>SpotiSieve</h2>"
+                b"<p>Login completed. You can close this tab and go back to the app.</p></body></html>"
+            )
+
+        def log_message(self, *args):
+            pass  # keep the console quiet
+
+    server = HTTPServer((parsed.hostname, parsed.port), CallbackHandler)
+    server.timeout = 1
+    try:
+        open_browser(SPOTIFY_AUTH_URL + "?" + urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id": client_id,
+            "scope": SCOPE,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge_method": "S256",
+            "code_challenge": challenge,
+        }))
+        deadline = time.time() + timeout
+        while "code" not in result and "error" not in result and time.time() < deadline:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    if result.get("error") or not result.get("code"):
+        raise RuntimeError(f"Spotify login failed or timed out ({result.get('error') or 'no answer'}).")
+    if result.get("state") != state:
+        raise RuntimeError("Spotify login rejected: state mismatch.")
+
+    token = _post_form(SPOTIFY_TOKEN_URL, {
+        "grant_type": "authorization_code",
+        "code": result["code"],
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": verifier,
+    })
+    token["client_id"] = client_id
+    _save_token(cache_path, token)
+    return token["access_token"]
+
+
+def spotify_api(method, path, token, payload=None):
+    """Small JSON helper for the Spotify Web API (retries once on rate limiting)."""
+    body = json.dumps(payload).encode() if payload is not None else None
+    for attempt in range(2):
+        request = urllib.request.Request(
+            SPOTIFY_API_URL + path,
+            data=body,
+            method=method,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as err:
+            if err.code == 429 and attempt == 0:
+                time.sleep(min(int(err.headers.get("Retry-After", "2")), 30) + 1)
+                continue
+            raise SpotifyAPIError(err.code, err.read().decode(errors="replace")) from err
+    return {}
+
+
+def load_settings():
+    try:
+        data = json.loads(SETTINGS_FILE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    SETTINGS_FILE_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+# ==================================================================
+# GUI
+# ==================================================================
 class SettingsWindow(ctk.CTkToplevel):
-    """Modal window to input and save Spotify API credentials into the local .env file."""
+    """Modal window for the OPTIONAL Spotify login (needed only for the direct import)."""
 
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
 
-        self.title("Spotify API Settings")
-        self.geometry("520x360")
+        self.title("Spotify Login (optional)")
+        self.geometry("540x400")
         self.resizable(False, False)
 
         # Keep modal window on top of the main application
@@ -68,146 +498,70 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             container,
-            text="Spotify API Credentials Setup",
+            text="Spotify Login (optional)",
             font=ctk.CTkFont(size=16, weight="bold")
         ).pack(anchor="w", padx=15, pady=(12, 4))
 
         ctk.CTkLabel(
             container,
-            text="Your keys are stored exclusively on your computer inside the local '.env' file.",
+            text=(
+                "You do NOT need this to filter playlists, copy links or save a CSV.\n"
+                "It is only needed for the one-click 'Import to Spotify' button.\n"
+                "Paste the Client ID of a Spotify Developer app (no Client Secret needed)."
+            ),
             font=ctk.CTkFont(size=12),
-            text_color="#b3b3b3"
+            text_color="#b3b3b3",
+            justify="left"
         ).pack(anchor="w", padx=15, pady=(0, 12))
 
-        # --- Client ID ---
         ctk.CTkLabel(
-            container,
-            text="Client ID:",
-            font=ctk.CTkFont(size=13, weight="bold")
+            container, text="Client ID:", font=ctk.CTkFont(size=13, weight="bold")
         ).pack(anchor="w", padx=15)
-
         self.client_id_entry = ctk.CTkEntry(
-            container,
-            placeholder_text="Paste your Spotify Client ID here",
-            height=34
+            container, placeholder_text="Paste your Spotify Client ID here", height=34
         )
         self.client_id_entry.pack(fill="x", padx=15, pady=(2, 10))
         self.client_id_entry.insert(0, self.parent.client_id)
 
-        # --- Client Secret ---
-        secret_header = ctk.CTkFrame(container, fg_color="transparent")
-        secret_header.pack(fill="x", padx=15)
-
         ctk.CTkLabel(
-            secret_header,
-            text="Client Secret:",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left")
-
-        self.show_secret_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            secret_header,
-            text="Show",
-            variable=self.show_secret_var,
-            command=self._toggle_secret_visibility,
-            checkbox_width=18,
-            checkbox_height=18,
-            font=ctk.CTkFont(size=12)
-        ).pack(side="right")
-
-        self.client_secret_entry = ctk.CTkEntry(
-            container,
-            placeholder_text="Paste your Spotify Client Secret here",
-            height=34,
-            show="•"
-        )
-        self.client_secret_entry.pack(fill="x", padx=15, pady=(2, 10))
-        self.client_secret_entry.insert(0, self.parent.client_secret)
-
-        # --- Redirect URI ---
-        ctk.CTkLabel(
-            container,
-            text="Redirect URI:",
-            font=ctk.CTkFont(size=13, weight="bold")
+            container, text="Redirect URI:", font=ctk.CTkFont(size=13, weight="bold")
         ).pack(anchor="w", padx=15)
-
-        self.redirect_uri_entry = ctk.CTkEntry(
-            container,
-            height=34
-        )
+        self.redirect_uri_entry = ctk.CTkEntry(container, height=34)
         self.redirect_uri_entry.pack(fill="x", padx=15, pady=(2, 15))
         self.redirect_uri_entry.insert(0, self.parent.redirect_uri)
 
-        # --- Save / Cancel Buttons ---
         btn_frame = ctk.CTkFrame(container, fg_color="transparent")
         btn_frame.pack(fill="x", padx=15, pady=(5, 10))
 
         ctk.CTkButton(
-            btn_frame,
-            text="Cancel",
-            fg_color=COLOR_BTN_OFF,
-            hover_color=COLOR_BTN_OFF_HOVER,
-            width=110,
-            height=36,
-            command=self.destroy
+            btn_frame, text="Log out", fg_color=COLOR_BTN_OFF, hover_color=COLOR_BTN_OFF_HOVER,
+            width=90, height=36, command=self._logout
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            btn_frame, text="Cancel", fg_color=COLOR_BTN_OFF, hover_color=COLOR_BTN_OFF_HOVER,
+            width=100, height=36, command=self.destroy
         ).pack(side="right", padx=(10, 0))
 
         ctk.CTkButton(
-            btn_frame,
-            text="Save to .env",
-            fg_color=COLOR_SPOTIFY_GREEN,
-            hover_color=COLOR_SPOTIFY_HOVER,
-            text_color="#000000",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            width=160,
-            height=36,
-            command=self._save_credentials
+            btn_frame, text="Save", fg_color=COLOR_SPOTIFY_GREEN, hover_color=COLOR_SPOTIFY_HOVER,
+            text_color="#000000", font=ctk.CTkFont(size=13, weight="bold"),
+            width=120, height=36, command=self._save
         ).pack(side="right")
 
-    def _toggle_secret_visibility(self):
-        if self.show_secret_var.get():
-            self.client_secret_entry.configure(show="")
-        else:
-            self.client_secret_entry.configure(show="•")
+    def _logout(self):
+        self.parent.logout()
+        messagebox.showinfo("Logged out", "The saved Spotify login was removed.", parent=self)
 
-    def _save_credentials(self):
+    def _save(self):
         new_id = self.client_id_entry.get().strip()
-        new_secret = self.client_secret_entry.get().strip()
         new_uri = self.redirect_uri_entry.get().strip() or DEFAULT_REDIRECT_URI
-
-        if not new_id or not new_secret:
-            messagebox.showwarning(
-                "Missing Fields",
-                "Please enter both your Client ID and Client Secret.",
-                parent=self
-            )
-            return
-
         try:
-            # Create the .env file if it does not exist yet
-            if not ENV_FILE_PATH.exists():
-                ENV_FILE_PATH.touch()
-
-            # Write or update keys in the local .env file
-            set_key(str(ENV_FILE_PATH), "SPOTIPY_CLIENT_ID", new_id)
-            set_key(str(ENV_FILE_PATH), "SPOTIPY_CLIENT_SECRET", new_secret)
-            set_key(str(ENV_FILE_PATH), "SPOTIPY_REDIRECT_URI", new_uri)
-
-            # Update in-memory credentials on the main application
-            self.parent.update_credentials(new_id, new_secret, new_uri)
-
-            messagebox.showinfo(
-                "Settings Saved",
-                "API credentials successfully saved to '.env'!",
-                parent=self
-            )
-            self.destroy()
-        except Exception as e:
-            messagebox.showerror(
-                "Save Error",
-                f"Failed to save the .env file:\n{e}",
-                parent=self
-            )
+            self.parent.update_settings(new_id, new_uri)
+        except OSError as err:
+            messagebox.showerror("Save Error", f"Failed to save settings:\n{err}", parent=self)
+            return
+        self.destroy()
 
 
 class SpotifyGenreExtractorApp(ctk.CTk):
@@ -215,36 +569,29 @@ class SpotifyGenreExtractorApp(ctk.CTk):
         super().__init__()
 
         self.title("SpotiSieve - Spotify Playlist Genre Extractor")
-        self.geometry("1120x840")
+        self.geometry("1120x880")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
 
-        # Load credentials from environment variables (.env)
-        self.client_id = self._clean_env_val(os.getenv("SPOTIPY_CLIENT_ID", ""))
-        self.client_secret = self._clean_env_val(os.getenv("SPOTIPY_CLIENT_SECRET", ""))
-        self.redirect_uri = self._clean_env_val(
-            os.getenv("SPOTIPY_REDIRECT_URI", DEFAULT_REDIRECT_URI)
-        )
+        # Optional login settings (settings.json, never needed for filtering)
+        settings = load_settings()
+        self.client_id = (settings.get("client_id") or BUNDLED_CLIENT_ID).strip()
+        self.redirect_uri = (settings.get("redirect_uri") or DEFAULT_REDIRECT_URI).strip()
 
         # Application state
         self.selected_genres = set()
         self.genre_buttons = {}
         self.filtered_tracks = []  # List of track dictionaries
         self.track_rows = {}       # Maps uri -> {"frame": widget, "search_blob": str}
-        self.sp = None
         self.settings_win = None
+        self.genre_lookup = GenreLookup(GENRE_CACHE_FILE_PATH)
+        self.cancel_event = threading.Event()
+        self.running = False
 
         self._build_ui()
 
-    @staticmethod
-    def _clean_env_val(val):
-        """Ignore placeholder values coming from .env.example."""
-        if not val or "inserisci_qui" in val.lower() or "your_personal" in val.lower():
-            return ""
-        return val.strip()
-
     def _build_ui(self):
-        # --- 1. PLAYLIST URL SECTION & API SETTINGS BUTTON ---
+        # --- 1. CSV FILE SECTION & LOGIN SETTINGS BUTTON ---
         top_frame = ctk.CTkFrame(self, corner_radius=10)
         top_frame.pack(fill="x", padx=20, pady=(15, 10))
 
@@ -253,14 +600,14 @@ class SpotifyGenreExtractorApp(ctk.CTk):
 
         ctk.CTkLabel(
             header_bar,
-            text="1. Enter Public Spotify Playlist Link or ID:",
+            text="1. Load your playlist CSV (no Spotify account or API key needed):",
             font=ctk.CTkFont(size=14, weight="bold")
         ).pack(side="left")
 
         self.settings_btn = ctk.CTkButton(
             header_bar,
-            text="⚙️ API Settings",
-            width=150,
+            text="⚙️ Spotify Login (optional)",
+            width=200,
             height=30,
             fg_color=COLOR_BTN_OFF,
             hover_color=COLOR_BTN_OFF_HOVER,
@@ -271,13 +618,43 @@ class SpotifyGenreExtractorApp(ctk.CTk):
         )
         self.settings_btn.pack(side="right")
 
-        self.url_entry = ctk.CTkEntry(
-            top_frame,
-            placeholder_text="https://open.spotify.com/playlist/...",
+        file_row = ctk.CTkFrame(top_frame, fg_color="transparent")
+        file_row.pack(fill="x", padx=15, pady=(0, 12))
+
+        self.exportify_btn = ctk.CTkButton(
+            file_row,
+            text="🌐 Get your CSV on Exportify",
+            width=230,
+            height=38,
+            fg_color=COLOR_BTN_OFF,
+            hover_color=COLOR_BTN_OFF_HOVER,
+            border_width=1,
+            border_color="#404040",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.open_exportify
+        )
+        self.exportify_btn.pack(side="right", padx=(8, 0))
+
+        self.browse_btn = ctk.CTkButton(
+            file_row,
+            text="Browse CSV…",
+            width=130,
+            height=38,
+            fg_color=COLOR_SPOTIFY_GREEN,
+            hover_color=COLOR_SPOTIFY_HOVER,
+            text_color="#000000",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.browse_csv
+        )
+        self.browse_btn.pack(side="right", padx=(8, 0))
+
+        self.path_entry = ctk.CTkEntry(
+            file_row,
+            placeholder_text="Path of the playlist CSV file (e.g. exported with Exportify)",
             height=38,
             font=ctk.CTkFont(size=13)
         )
-        self.url_entry.pack(fill="x", padx=15, pady=(0, 12))
+        self.path_entry.pack(side="left", fill="x", expand=True)
 
         # --- 2. GENRE MATRIX SECTION (3 rows x 8 columns) ---
         genre_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -314,7 +691,7 @@ class SpotifyGenreExtractorApp(ctk.CTk):
             btn.grid(row=row, column=col, padx=5, pady=5, sticky="ew")
             self.genre_buttons[genre] = btn
 
-        # --- 3. LARGE START BUTTON & STATUS BAR ---
+        # --- 3. LARGE START BUTTON, PROGRESS & STATUS BAR ---
         action_frame = ctk.CTkFrame(self, fg_color="transparent")
         action_frame.pack(fill="x", padx=20, pady=8)
 
@@ -327,13 +704,17 @@ class SpotifyGenreExtractorApp(ctk.CTk):
             hover_color=COLOR_SPOTIFY_HOVER,
             text_color="#000000",
             font=ctk.CTkFont(size=16, weight="bold"),
-            command=self.start_extraction_thread
+            command=self.on_start_clicked
         )
         self.start_btn.pack(fill="x")
 
+        self.progress = ctk.CTkProgressBar(action_frame, height=8, progress_color=COLOR_SPOTIFY_GREEN)
+        self.progress.set(0)
+        self.progress.pack(fill="x", pady=(8, 0))
+
         self.status_label = ctk.CTkLabel(
             action_frame,
-            text="Ready. Paste a playlist link, select genres, and click Start.",
+            text="Ready. Load a playlist CSV, select genres, and click Start.",
             font=ctk.CTkFont(size=13),
             text_color="#b3b3b3"
         )
@@ -385,15 +766,59 @@ class SpotifyGenreExtractorApp(ctk.CTk):
         self.tracks_scroll = ctk.CTkScrollableFrame(preview_frame, corner_radius=8)
         self.tracks_scroll.pack(fill="both", expand=True, padx=15, pady=(0, 12))
 
-        # --- 5. PLAYLIST CREATION & IMPORT SECTION ---
+        # --- 5. EXPORT SECTION (copy links / save CSV / optional direct import) ---
         bottom_frame = ctk.CTkFrame(self, corner_radius=10)
         bottom_frame.pack(fill="x", padx=20, pady=(5, 15))
 
         ctk.CTkLabel(
             bottom_frame,
-            text="New Playlist Name:",
+            text="Playlist Name:",
             font=ctk.CTkFont(size=14, weight="bold")
         ).pack(side="left", padx=(15, 10), pady=12)
+
+        self.import_btn = ctk.CTkButton(
+            bottom_frame,
+            text="IMPORT TO SPOTIFY (login)",
+            height=38,
+            width=210,
+            fg_color=COLOR_SPOTIFY_GREEN,
+            hover_color=COLOR_SPOTIFY_HOVER,
+            text_color="#000000",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            state="disabled",
+            command=self.start_import_thread
+        )
+        self.import_btn.pack(side="right", padx=(0, 15), pady=12)
+
+        self.csv_btn = ctk.CTkButton(
+            bottom_frame,
+            text="SAVE CSV",
+            height=38,
+            width=110,
+            fg_color=COLOR_BTN_OFF,
+            hover_color=COLOR_BTN_OFF_HOVER,
+            border_width=1,
+            border_color="#404040",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            state="disabled",
+            command=self.save_csv
+        )
+        self.csv_btn.pack(side="right", padx=(0, 8), pady=12)
+
+        self.copy_btn = ctk.CTkButton(
+            bottom_frame,
+            text="COPY SPOTIFY LINKS",
+            height=38,
+            width=170,
+            fg_color=COLOR_BTN_OFF,
+            hover_color=COLOR_BTN_OFF_HOVER,
+            border_width=1,
+            border_color="#404040",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            state="disabled",
+            command=self.copy_links
+        )
+        self.copy_btn.pack(side="right", padx=(0, 8), pady=12)
 
         self.playlist_name_entry = ctk.CTkEntry(
             bottom_frame,
@@ -403,22 +828,10 @@ class SpotifyGenreExtractorApp(ctk.CTk):
         )
         self.playlist_name_entry.pack(side="left", fill="x", expand=True, padx=(0, 15), pady=12)
 
-        self.import_btn = ctk.CTkButton(
-            bottom_frame,
-            text="IMPORT TO SPOTIFY",
-            height=38,
-            width=220,
-            fg_color=COLOR_SPOTIFY_GREEN,
-            hover_color=COLOR_SPOTIFY_HOVER,
-            text_color="#000000",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            state="disabled",
-            command=self.start_import_thread
-        )
-        self.import_btn.pack(side="right", padx=(0, 15), pady=12)
+        self.output_buttons = [self.copy_btn, self.csv_btn, self.import_btn]
 
     # ==========================================
-    # SETTINGS WINDOW & CREDENTIAL MANAGEMENT
+    # OPTIONAL LOGIN SETTINGS
     # ==========================================
     def open_settings_window(self):
         if self.settings_win is None or not self.settings_win.winfo_exists():
@@ -426,23 +839,20 @@ class SpotifyGenreExtractorApp(ctk.CTk):
         else:
             self.settings_win.focus()
 
-    def update_credentials(self, client_id, client_secret, redirect_uri):
-        """Update active credentials and clear any previous OAuth token cache."""
-        self.client_id = client_id
-        self.client_secret = client_secret
+    def update_settings(self, client_id, redirect_uri):
+        """Save the optional login settings and forget any previous login."""
+        save_settings({"client_id": client_id, "redirect_uri": redirect_uri})
+        self.client_id = client_id.strip() or BUNDLED_CLIENT_ID
         self.redirect_uri = redirect_uri
-        self.sp = None
+        self.logout()
+        self._update_status("Spotify login settings saved.")
 
+    def logout(self):
         if CACHE_FILE_PATH.exists():
             try:
                 CACHE_FILE_PATH.unlink()
             except OSError:
                 pass
-
-        self._update_status("API credentials updated and saved to '.env'.")
-
-    def has_valid_credentials(self):
-        return bool(self.client_id and self.client_secret)
 
     # ==========================================
     # UI LOGIC, GENRE TOGGLE & LIVE SEARCH
@@ -466,6 +876,23 @@ class SpotifyGenreExtractorApp(ctk.CTk):
                 text_color="#000000",
                 border_color=COLOR_SPOTIFY_GREEN
             )
+
+    def open_exportify(self):
+        """Open the Exportify website (where the playlist CSV is exported) in the default browser."""
+        if not webbrowser.open(EXPORTIFY_URL):
+            messagebox.showinfo(
+                "Open this page",
+                f"Could not open the browser automatically.\nOpen this address manually:\n\n{EXPORTIFY_URL}"
+            )
+
+    def browse_csv(self):
+        path = filedialog.askopenfilename(
+            title="Select the playlist CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if path:
+            self.path_entry.delete(0, "end")
+            self.path_entry.insert(0, path)
 
     def clear_search(self):
         """Reset the search bar and show all extracted tracks."""
@@ -492,156 +919,110 @@ class SpotifyGenreExtractorApp(ctk.CTk):
 
         self._update_counter_label(visible_count=visible_count, is_filtering=bool(query))
 
-    def authenticate_spotify(self):
-        """Initialize the Spotipy client using OAuth."""
-        if self.sp is None:
-            auth_manager = SpotifyOAuth(
-                client_id=self.client_id,
-                client_secret=self.client_secret,
-                redirect_uri=self.redirect_uri,
-                scope=SCOPE,
-                cache_path=str(CACHE_FILE_PATH)
-            )
-            self.sp = spotipy.Spotify(auth_manager=auth_manager)
-
-    @staticmethod
-    def extract_playlist_id(url_or_id):
-        """Extract the Spotify playlist ID from a URL or return the raw ID."""
-        match = re.search(r"playlist/([a-zA-Z0-9]+)", url_or_id)
-        if match:
-            return match.group(1)
-        return url_or_id.strip()
-
     # ==========================================
     # PHASE 1: TRACK EXTRACTION & FILTERING
     # ==========================================
-    def start_extraction_thread(self):
-        if not self.has_valid_credentials():
-            messagebox.showinfo(
-                "API Setup Required",
-                "Please enter your Spotify Client ID and Client Secret in the API Settings window before starting."
-            )
-            self.open_settings_window()
+    def on_start_clicked(self):
+        if self.running:
+            self.cancel_event.set()
+            self._update_status("Cancelling... (progress is saved)")
             return
+        self.start_extraction_thread()
 
-        url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showwarning("Missing URL", "Please enter a Spotify playlist link or ID.")
+    def start_extraction_thread(self):
+        path = self.path_entry.get().strip().strip('"')
+        if not path:
+            messagebox.showwarning("Missing CSV", "Please load a playlist CSV file first.")
             return
         if not self.selected_genres:
             messagebox.showwarning("No Genres Selected", "Please select at least one musical genre.")
             return
 
-        self.start_btn.configure(state="disabled")
-        self.import_btn.configure(state="disabled")
+        self.cancel_event.clear()
+        self._set_running(True)
+        self._set_outputs(False)
         self.search_var.set("")
         self._clear_preview_list()
 
-        thread = threading.Thread(target=self._extract_tracks_worker, args=(url,), daemon=True)
+        thread = threading.Thread(
+            target=self._extract_tracks_worker,
+            args=(path, set(self.selected_genres)),
+            daemon=True
+        )
         thread.start()
 
-    def _extract_tracks_worker(self, url):
+    def _extract_tracks_worker(self, path, selected_genres):
         try:
-            self._update_status("Authenticating with Spotify...")
-            self.authenticate_spotify()
-
-            playlist_id = self.extract_playlist_id(url)
-            self._update_status("Fetching playlist tracks (this may take a few seconds for 100+ hour playlists)...")
-
-            # 1. Fetch all tracks handling pagination in batches of 100
-            raw_tracks = []
-            results = self.sp.playlist_items(
-                playlist_id,
-                additional_types=("track",),
-                limit=100
-            )
-
-            while results:
-                for item in results.get("items", []):
-                    track = item.get("track")
-                    # Skip local files or unavailable tracks
-                    if track and track.get("id") and track.get("type") == "track":
-                        raw_tracks.append(track)
-
-                self._update_status(f"Downloading tracks... ({len(raw_tracks)} read)")
-                if results.get("next"):
-                    results = self.sp.next(results)
-                else:
-                    break
-
-            if not raw_tracks:
-                self._update_status("No valid tracks found in this playlist.")
-                self._reenable_start()
+            self._update_status("Reading the CSV file...")
+            tracks = parse_playlist_csv(path)
+            if not tracks:
+                self._update_status("No valid tracks found in this file.")
                 return
 
-            # 2. Collect unique artist IDs and request genres in batches of 50
-            unique_artist_ids = list({
-                artist["id"]
-                for track in raw_tracks
-                for artist in track.get("artists", [])
-                if artist.get("id")
-            })
-
-            self._update_status(f"Analyzing genres for {len(unique_artist_ids)} unique artists...")
-            artist_genres_map = {}
-
-            for i in range(0, len(unique_artist_ids), 50):
-                batch_ids = unique_artist_ids[i:i + 50]
-                artists_data = self.sp.artists(batch_ids).get("artists", [])
-                for artist_obj in artists_data:
-                    if artist_obj and artist_obj.get("id"):
-                        artist_genres_map[artist_obj["id"]] = [
-                            g.lower() for g in artist_obj.get("genres", [])
-                        ]
-
-            # 3. Filter tracks matching the selected genres
-            matched_tracks = []
-            seen_uris = set()
-
-            for track in raw_tracks:
-                uri = track["uri"]
-                if uri in seen_uris:
+            # Artists whose genres are not already provided by the CSV
+            artists = {}
+            for track in tracks:
+                if track["csv_genres"]:
                     continue
+                for name in track["artists"]:
+                    artists.setdefault(name.strip().lower(), name)
 
-                artists = track.get("artists", [])
-                if not artists:
-                    continue
-
-                # Combine genres from all artists credited on the track
-                track_genres = set()
-                for a in artists:
-                    a_id = a.get("id")
-                    if a_id in artist_genres_map:
-                        track_genres.update(artist_genres_map[a_id])
-
-                # Substring match to capture sub-genres (e.g., "pop" matches "dance pop")
-                is_match = any(
-                    sel_genre in sp_genre
-                    for sel_genre in self.selected_genres
-                    for sp_genre in track_genres
+            to_fetch = sum(1 for name in artists.values() if not self.genre_lookup.has(name))
+            if to_fetch:
+                minutes = max(1, round(to_fetch * MB_MIN_INTERVAL / 60))
+                self._update_status(
+                    f"Looking up genres for {to_fetch} artists on MusicBrainz (about {minutes} min, "
+                    f"results are saved for next time)..."
                 )
 
-                if is_match:
-                    seen_uris.add(uri)
-                    main_artist = artists[0]["name"]
-                    feat_artists = [a["name"] for a in artists[1:]]
-                    feat_str = f" (feat. {', '.join(feat_artists)})" if feat_artists else ""
+            artist_genres = {}
+            total = max(len(artists), 1)
+            for done, (key, name) in enumerate(artists.items(), start=1):
+                if self.cancel_event.is_set():
+                    self._update_status("Cancelled. Progress is saved: start again to continue.")
+                    return
+                artist_genres[key] = self.genre_lookup.get(name)
+                self._set_progress(done / total)
+                if to_fetch and done % 5 == 0:
+                    self._update_status(f"Genre lookup: {done}/{total} artists...")
+            self._set_progress(1)
 
-                    matched_tracks.append({
-                        "uri": uri,
-                        "title": track.get("name", "Unknown Title"),
-                        "album": track.get("album", {}).get("name", "Unknown Album"),
-                        "author": main_artist,
-                        "feat": feat_str
-                    })
+            # Filter tracks matching the selected genres
+            matched = []
+            for track in tracks:
+                genres = list(track["csv_genres"])
+                if not genres:
+                    for name in track["artists"]:
+                        genres.extend(artist_genres.get(name.strip().lower(), []))
 
-            # 4. Populate UI on the main thread
-            self.after(0, self._populate_preview_list, matched_tracks, len(raw_tracks))
+                if not track_matches(selected_genres, genres):
+                    continue
 
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Spotify API Error", f"An error occurred:\n{e}"))
+                feat = f" (feat. {', '.join(track['artists'][1:])})" if len(track["artists"]) > 1 else ""
+                matched.append({
+                    "uri": track["uri"],
+                    "spotify_uri": track["spotify_uri"],
+                    "title": track["title"],
+                    "album": track["album"] or "Unknown Album",
+                    "author": track["artists"][0],
+                    "artists": track["artists"],
+                    "feat": feat,
+                    "genres": ", ".join(genres[:6]),
+                })
+
+            self.after(0, self._populate_preview_list, matched, len(tracks))
+
+        except (ValueError, GenreServiceError) as err:
+            message = str(err)
+            self.after(0, lambda: messagebox.showerror("Extraction Error", message))
             self._update_status("Error during track extraction.")
-            self._reenable_start()
+        except Exception as err:  # unexpected problem: show it instead of failing silently
+            message = f"An unexpected error occurred:\n{err}"
+            self.after(0, lambda: messagebox.showerror("Unexpected Error", message))
+            self._update_status("Error during track extraction.")
+        finally:
+            self.genre_lookup.save()
+            self.after(0, lambda: self._set_running(False))
 
     def _populate_preview_list(self, matched_tracks, total_scanned):
         self.filtered_tracks = matched_tracks
@@ -652,9 +1033,7 @@ class SpotifyGenreExtractorApp(ctk.CTk):
         self._update_status(
             f"Extraction complete: {len(matched_tracks)} matching tracks found out of {total_scanned} scanned."
         )
-        self.start_btn.configure(state="normal")
-        if self.filtered_tracks:
-            self.import_btn.configure(state="normal")
+        self._set_outputs(bool(self.filtered_tracks))
 
     def _create_track_row(self, track_data):
         uri = track_data["uri"]
@@ -711,7 +1090,7 @@ class SpotifyGenreExtractorApp(ctk.CTk):
         self._on_search_changed()
 
         if not self.filtered_tracks:
-            self.import_btn.configure(state="disabled")
+            self._set_outputs(False)
 
     def _clear_preview_list(self):
         for widget in self.tracks_scroll.winfo_children():
@@ -732,68 +1111,155 @@ class SpotifyGenreExtractorApp(ctk.CTk):
             )
 
     # ==========================================
-    # PHASE 2: PLAYLIST CREATION & IMPORT
+    # PHASE 2: EXPORT (no login needed) 
+    # ==========================================
+    def _importable_uris(self):
+        return [t["spotify_uri"] for t in self.filtered_tracks if t.get("spotify_uri")]
+
+    def copy_links(self):
+        uris = self._importable_uris()
+        if not uris:
+            messagebox.showwarning(
+                "No Spotify links",
+                "The CSV has no Spotify track URIs, so links cannot be created.\n"
+                "Use 'Save CSV' instead, or export the playlist with Exportify."
+            )
+            return
+
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(uri_to_link(u) for u in uris))
+        self.update()  # keep the clipboard content after the window loses focus
+
+        skipped = len(self.filtered_tracks) - len(uris)
+        extra = f"\n({skipped} tracks without a Spotify link were skipped.)" if skipped else ""
+        messagebox.showinfo(
+            "Links copied",
+            f"{len(uris)} track links copied to the clipboard.\n\n"
+            "In the Spotify desktop app: create a new playlist, click in its track list "
+            f"and press Ctrl+V.{extra}"
+        )
+
+    def save_csv(self):
+        suggested = (self.playlist_name_entry.get().strip() or "spotisieve_playlist") + ".csv"
+        path = filedialog.asksaveasfilename(
+            title="Save the filtered playlist",
+            defaultextension=".csv",
+            initialfile=suggested,
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["Track URI", "Track Name", "Artist Name(s)", "Album Name", "Genres"])
+                for t in self.filtered_tracks:
+                    writer.writerow([
+                        t.get("spotify_uri") or "", t["title"], ";".join(t["artists"]),
+                        t["album"], t.get("genres", "")
+                    ])
+            self._update_status(f"Saved {len(self.filtered_tracks)} tracks to {Path(path).name}.")
+        except OSError as err:
+            messagebox.showerror("Save Error", f"Could not save the file:\n{err}")
+
+    # ==========================================
+    # PHASE 3 (OPTIONAL): DIRECT IMPORT WITH SPOTIFY LOGIN
     # ==========================================
     def start_import_thread(self):
+        if not self.client_id:
+            messagebox.showinfo(
+                "Login not configured",
+                "Direct import needs a Spotify Client ID (see 'Spotify Login (optional)').\n\n"
+                "No problem: you can use 'Copy Spotify Links' and paste them into a new playlist, "
+                "or 'Save CSV'."
+            )
+            self.open_settings_window()
+            return
+
         playlist_name = self.playlist_name_entry.get().strip()
         if not playlist_name:
             messagebox.showwarning("Missing Name", "Please enter a name for the new playlist before importing.")
             return
-        if not self.filtered_tracks:
-            messagebox.showwarning("Empty List", "There are no tracks left to import.")
+        uris = self._importable_uris()
+        if not uris:
+            messagebox.showwarning("Empty List", "There are no tracks with a Spotify link to import.")
             return
 
-        self.import_btn.configure(state="disabled")
+        self._set_outputs(False)
         self.start_btn.configure(state="disabled")
-
+        genres_str = ", ".join(sorted(self.selected_genres))
         thread = threading.Thread(
             target=self._import_playlist_worker,
-            args=(playlist_name,),
+            args=(playlist_name, uris, genres_str),
             daemon=True
         )
         thread.start()
 
-    def _import_playlist_worker(self, playlist_name):
+    def _import_playlist_worker(self, playlist_name, uris, genres_str):
         try:
-            self._update_status("Creating new playlist in your Spotify account...")
-            user_id = self.sp.current_user()["id"]
-            genres_str = ", ".join(sorted(self.selected_genres))
+            self._update_status("Waiting for Spotify login in your browser (3 minutes max)...")
+            token = spotify_login(self.client_id, self.redirect_uri, CACHE_FILE_PATH)
 
-            new_playlist = self.sp.user_playlist_create(
-                user=user_id,
-                name=playlist_name,
-                public=False,
-                description=f"Generated by SpotiSieve — Filtered genres: {genres_str}"
-            )
-            new_playlist_id = new_playlist["id"]
+            self._update_status("Creating new playlist in your Spotify account...")
+            playlist = spotify_api("POST", "/me/playlists", token, {
+                "name": playlist_name,
+                "public": False,
+                "description": f"Generated by SpotiSieve - Filtered genres: {genres_str}",
+            })
+            playlist_id = playlist["id"]
 
             # Add tracks in batches of 100 (Spotify API limit per request)
-            uris = [t["uri"] for t in self.filtered_tracks]
             for i in range(0, len(uris), 100):
-                batch = uris[i:i + 100]
-                self.sp.playlist_add_items(new_playlist_id, batch)
+                spotify_api("POST", f"/playlists/{playlist_id}/items", token, {"uris": uris[i:i + 100]})
                 self._update_status(f"Importing tracks: {min(i + 100, len(uris))}/{len(uris)}...")
 
             self._update_status(f"Playlist '{playlist_name}' successfully created on Spotify!")
-            self.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Import Complete",
-                    f"Playlist '{playlist_name}' ({len(uris)} tracks) is now available in your Spotify library!"
-                )
-            )
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Import Error", f"Failed to create playlist:\n{e}"))
+            self.after(0, lambda: messagebox.showinfo(
+                "Import Complete",
+                f"Playlist '{playlist_name}' ({len(uris)} tracks) is now in your Spotify library!"
+            ))
+        except SpotifyAPIError as err:
+            hint = ""
+            if err.status in (401, 403):
+                hint = ("\n\nIn Spotify Development Mode only users added by the app owner can log in. "
+                        "Use 'Copy Spotify Links' as an alternative.")
+            message = f"{err}{hint}"
+            self.after(0, lambda: messagebox.showerror("Import Error", message))
+            self._update_status("Error while importing playlist.")
+        except Exception as err:
+            message = f"Failed to create playlist:\n{err}"
+            self.after(0, lambda: messagebox.showerror("Import Error", message))
             self._update_status("Error while importing playlist.")
         finally:
-            self._reenable_start()
-            self.after(0, lambda: self.import_btn.configure(state="normal"))
+            self.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.after(0, lambda: self._set_outputs(bool(self.filtered_tracks)))
 
+    # ==========================================
+    # SMALL UI HELPERS (safe to call from worker threads)
+    # ==========================================
     def _update_status(self, message):
         self.after(0, lambda: self.status_label.configure(text=message))
 
-    def _reenable_start(self):
-        self.after(0, lambda: self.start_btn.configure(state="normal"))
+    def _set_progress(self, value):
+        self.after(0, lambda: self.progress.set(value))
+
+    def _set_running(self, running):
+        self.running = running
+        if running:
+            self.progress.set(0)
+            self.start_btn.configure(
+                text="CANCEL", fg_color=COLOR_REMOVE, hover_color=COLOR_REMOVE_HOVER, text_color="#ffffff"
+            )
+        else:
+            self.start_btn.configure(
+                text="START TRACK EXTRACTION", fg_color=COLOR_SPOTIFY_GREEN,
+                hover_color=COLOR_SPOTIFY_HOVER, text_color="#000000"
+            )
+
+    def _set_outputs(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for button in self.output_buttons:
+            button.configure(state=state)
 
 
 if __name__ == "__main__":

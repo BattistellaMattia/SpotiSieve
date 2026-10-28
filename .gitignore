@@ -1,10 +1,14 @@
 # ==========================================
-# CREDENZIALI E TOKEN SPOTIFY (CRITICO!)
+# LOCAL DATA CREATED BY THE APP
 # ==========================================
-.env
-.env.local
+settings.json
+genre_cache.json
 .cache
 .cache-*
+
+# Old credentials files (no longer used, kept ignored for safety)
+.env
+.env.local
 
 # ==========================================
 # PYTHON & COMPILAZIONE
@@ -16,6 +20,7 @@ __pycache__/
 build/
 dist/
 *.spec
+.pytest_cache/
 
 # ==========================================
 # AMBIENTI VIRTUALI

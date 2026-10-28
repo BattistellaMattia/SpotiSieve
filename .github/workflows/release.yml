@@ -1,0 +1,39 @@
+name: Build and publish release
+
+# Pushing a tag such as v1.0.0 builds SpotiSieve.exe on Windows
+# and attaches it to a GitHub Release automatically.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pyinstaller
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Build the executable
+        run: pyinstaller --noconsole --onefile --name SpotiSieve --collect-all customtkinter spotify_extractor.py
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SpotiSieve.exe
+          generate_release_notes: true
